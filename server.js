@@ -175,3 +175,60 @@ const PORT = process.env.PORT || 4000;
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 Gateway Server running on port ${PORT}`);
 });
+// Endpoint to fetch real historical candles from Dhan
+app.get('/api/charts/historical', async (req, res) => {
+  try {
+    const { securityId, exchangeSegment = 'NSE_EQ', instrument = 'EQUITY', expiryCode = 0, fromDate, toDate } = req.query;
+
+    if (!securityId) {
+      return res.status(400).json({ error: 'securityId is required' });
+    }
+
+    // Default dates: past 30 days to today (YYYY-MM-DD)
+    const today = new Date().toISOString().split('T')[0];
+    const past = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+
+    const payload = {
+      securityId: String(securityId),
+      exchangeSegment: exchangeSegment,
+      instrument: instrument,
+      expiryCode: Number(expiryCode),
+      fromDate: fromDate || past,
+      toDate: toDate || today
+    };
+
+    // Call Dhan v2 Charts Historical API (Daily or Intraday)
+    const dhanRes = await fetch('https://api.dhan.co/v2/charts/historical', {
+      method: 'POST',
+      headers: {
+        'access-token': process.env.DHAN_ACCESS_TOKEN,
+        'client-id': process.env.DHAN_CLIENT_ID,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(payload)
+    });
+
+    const data = await dhanRes.json();
+
+    // Dhan returns arrays: [open, high, low, close, volume, start_Time]
+    // Transform them to TradingView Lightweight Charts format
+    if (data && data.start_Time) {
+      const formattedBars = data.start_Time.map((time, idx) => ({
+        time: Math.floor(new Date(time).getTime() / 1000), // Epoch seconds
+        open: data.open[idx],
+        high: data.high[idx],
+        low: data.low[idx],
+        close: data.close[idx],
+      }));
+
+      // Sort chronologically ascending
+      formattedBars.sort((a, b) => a.time - b.time);
+      return res.json({ success: true, bars: formattedBars });
+    }
+
+    return res.status(404).json({ error: 'No data returned from Dhan', raw: data });
+  } catch (error) {
+    console.error('Historical fetch error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
