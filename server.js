@@ -30,7 +30,7 @@ if (!CLIENT_ID || !ACCESS_TOKEN) {
 }
 
 // ==========================================
-// REST Route: Historical OHLC Data Proxy
+// REST Route: Historical OHLC Data Proxy (With Date Fix)
 // ==========================================
 app.get('/api/charts/historical', async (req, res) => {
   try {
@@ -50,9 +50,24 @@ app.get('/api/charts/historical', async (req, res) => {
       return res.status(500).json({ error: 'Dhan ACCESS_TOKEN is not configured on server' });
     }
 
-    // Default dates: past 30 days to today (YYYY-MM-DD)
-    const today = new Date().toISOString().split('T')[0];
-    const past = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+    // Helper: Format date to YYYY-MM-DD in IST (Asia/Kolkata)
+    const formatISTDate = (dateObj) => {
+      return new Intl.DateTimeFormat('en-CA', {
+        timeZone: 'Asia/Kolkata',
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+      }).format(dateObj);
+    };
+
+    const now = new Date();
+    // Default past date (30 days back)
+    const pastDateObj = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+    // Tomorrow date (Required because Dhan's toDate is non-inclusive)
+    const tomorrowDateObj = new Date(now.getTime() + 24 * 60 * 60 * 1000);
+
+    const defaultFromDate = formatISTDate(pastDateObj);
+    const defaultToDate = formatISTDate(tomorrowDateObj);
 
     const payload = {
       securityId: String(securityId),
@@ -60,8 +75,8 @@ app.get('/api/charts/historical', async (req, res) => {
       instrument: instrument,
       expiryCode: 0,
       oi: false,
-      fromDate: fromDate || past,
-      toDate: toDate || today,
+      fromDate: fromDate || defaultFromDate,
+      toDate: toDate || defaultToDate, // Tomorrow's date includes today's candle
     };
 
     const dhanRes = await fetch('https://api.dhan.co/v2/charts/historical', {
