@@ -7,6 +7,7 @@ const cors = require('cors');
 
 const app = express();
 app.use(cors());
+app.use(express.json());
 
 // Railway / Uptime Health Check endpoint
 app.get('/', (req, res) => {
@@ -18,14 +19,6 @@ app.get('/', (req, res) => {
   });
 });
 
-const server = http.createServer(app);
-const io = new Server(server, {
-  cors: {
-    origin: '*', // प्रोडक्शन में अपनी Lovable डोमेन से भी बाइंड कर सकते हैं
-    methods: ['GET', 'POST'],
-  },
-});
-
 // ==========================================
 // Credentials from Environment Variables
 // ==========================================
@@ -35,6 +28,95 @@ const ACCESS_TOKEN = process.env.DHAN_ACCESS_TOKEN;
 if (!CLIENT_ID || !ACCESS_TOKEN) {
   console.error('⚠️ [CRITICAL] DHAN_CLIENT_ID or DHAN_ACCESS_TOKEN is missing in environment variables!');
 }
+
+// ==========================================
+// REST Route: Historical OHLC Data Proxy
+// ==========================================
+app.get('/api/charts/historical', async (req, res) => {
+  try {
+    const {
+      securityId,
+      exchangeSegment = 'NSE_EQ',
+      instrument = 'EQUITY',
+      fromDate,
+      toDate,
+    } = req.query;
+
+    if (!securityId) {
+      return res.status(400).json({ error: 'securityId parameter is required' });
+    }
+
+    if (!ACCESS_TOKEN) {
+      return res.status(500).json({ error: 'Dhan ACCESS_TOKEN is not configured on server' });
+    }
+
+    // Default dates: past 30 days to today (YYYY-MM-DD)
+    const today = new Date().toISOString().split('T')[0];
+    const past = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+
+    const payload = {
+      securityId: String(securityId),
+      exchangeSegment: exchangeSegment,
+      instrument: instrument,
+      expiryCode: 0,
+      oi: false,
+      fromDate: fromDate || past,
+      toDate: toDate || today,
+    };
+
+    const dhanRes = await fetch('https://api.dhan.co/v2/charts/historical', {
+      method: 'POST',
+      headers: {
+        'access-token': ACCESS_TOKEN,
+        'client-id': CLIENT_ID || '',
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+      },
+      body: JSON.stringify(payload),
+    });
+
+    const data = await dhanRes.json();
+
+    // Dhan returns timestamp or start_Time array
+    const timestamps = data.timestamp || data.start_Time;
+    if (data && data.open && data.open.length > 0 && timestamps) {
+      const bars = timestamps.map((time, idx) => {
+        const epochSeconds = typeof time === 'number'
+          ? (time > 9999999999 ? Math.floor(time / 1000) : time)
+          : Math.floor(new Date(time).getTime() / 1000);
+
+        return {
+          time: epochSeconds,
+          open: Number(data.open[idx]),
+          high: Number(data.high[idx]),
+          low: Number(data.low[idx]),
+          close: Number(data.close[idx]),
+          volume: Number(data.volume ? data.volume[idx] : 0),
+        };
+      });
+
+      // Sort chronological ascending order for Lightweight Charts
+      bars.sort((a, b) => a.time - b.time);
+      return res.json({ success: true, count: bars.length, bars });
+    }
+
+    return res.status(404).json({
+      error: 'No candle data returned from Dhan',
+      details: data,
+    });
+  } catch (error) {
+    console.error('[Historical API Error]', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+const server = http.createServer(app);
+const io = new Server(server, {
+  cors: {
+    origin: '*',
+    methods: ['GET', 'POST'],
+  },
+});
 
 const DHAN_WS_URL = `wss://api-feed.dhan.co?version=2&token=${encodeURIComponent(
   ACCESS_TOKEN || ''
@@ -172,63 +254,6 @@ io.on('connection', (socket) => {
 
 // Railway PORT binding on 0.0.0.0
 const PORT = process.env.PORT || 4000;
-// Endpoint to fetch real historical candles from Dhan
-app.get('/api/charts/historical', async (req, res) => {
-  try {
-    const { securityId, exchangeSegment = 'NSE_EQ', instrument = 'EQUITY', expiryCode = 0, fromDate, toDate } = req.query;
-
-    if (!securityId) {
-      return res.status(400).json({ error: 'securityId is required' });
-    }
-
-    // Default dates: past 30 days to today (YYYY-MM-DD)
-    const today = new Date().toISOString().split('T')[0];
-    const past = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
-
-    const payload = {
-      securityId: String(securityId),
-      exchangeSegment: exchangeSegment,
-      instrument: instrument,
-      expiryCode: Number(expiryCode),
-      fromDate: fromDate || past,
-      toDate: toDate || today
-    };
-
-    // Call Dhan v2 Charts Historical API (Daily or Intraday)
-    const dhanRes = await fetch('https://api.dhan.co/v2/charts/historical', {
-      method: 'POST',
-      headers: {
-        'access-token': process.env.DHAN_ACCESS_TOKEN,
-        'client-id': process.env.DHAN_CLIENT_ID,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify(payload)
-    });
-
-    const data = await dhanRes.json();
-
-    // Dhan returns arrays: [open, high, low, close, volume, start_Time]
-    // Transform them to TradingView Lightweight Charts format
-    if (data && data.start_Time) {
-      const formattedBars = data.start_Time.map((time, idx) => ({
-        time: Math.floor(new Date(time).getTime() / 1000), // Epoch seconds
-        open: data.open[idx],
-        high: data.high[idx],
-        low: data.low[idx],
-        close: data.close[idx],
-      }));
-
-      // Sort chronologically ascending
-      formattedBars.sort((a, b) => a.time - b.time);
-      return res.json({ success: true, bars: formattedBars });
-    }
-
-    return res.status(404).json({ error: 'No data returned from Dhan', raw: data });
-  } catch (error) {
-    console.error('Historical fetch error:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 Gateway Server running on port ${PORT}`);
 });
