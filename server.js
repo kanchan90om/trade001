@@ -172,9 +172,6 @@ io.on('connection', (socket) => {
 
 // Railway PORT binding on 0.0.0.0
 const PORT = process.env.PORT || 4000;
-server.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 Gateway Server running on port ${PORT}`);
-});
 // Endpoint to fetch real historical candles from Dhan
 app.get('/api/charts/historical', async (req, res) => {
   try {
@@ -231,4 +228,7 @@ app.get('/api/charts/historical', async (req, res) => {
     console.error('Historical fetch error:', error);
     res.status(500).json({ error: error.message });
   }
+});
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`🚀 Gateway Server running on port ${PORT}`);
 });
