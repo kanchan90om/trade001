@@ -30,7 +30,8 @@ if (!CLIENT_ID || !ACCESS_TOKEN) {
 }
 
 // ==========================================
-// REST Route: Historical OHLC Data Proxy (With Date Fix)
+// REST Route: Historical & Intraday Data Proxy
+// Supports: interval=1D (Daily) OR interval=1, 5, 15, 25, 60 (Intraday)
 // ==========================================
 app.get('/api/charts/historical', async (req, res) => {
   try {
@@ -38,6 +39,7 @@ app.get('/api/charts/historical', async (req, res) => {
       securityId,
       exchangeSegment = 'NSE_EQ',
       instrument = 'EQUITY',
+      interval = '1D', // Default: 1D. Also accepts: '1', '5', '15', '25', '60'
       fromDate,
       toDate,
     } = req.query;
@@ -60,26 +62,66 @@ app.get('/api/charts/historical', async (req, res) => {
       }).format(dateObj);
     };
 
-    const now = new Date();
-    // Default past date (30 days back)
-    const pastDateObj = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
-    // Tomorrow date (Required because Dhan's toDate is non-inclusive)
-    const tomorrowDateObj = new Date(now.getTime() + 24 * 60 * 60 * 1000);
+    // Helper: Format date & time to YYYY-MM-DD HH:mm:ss in IST
+    const formatISTDateTime = (dateObj) => {
+      const parts = new Intl.DateTimeFormat('en-GB', {
+        timeZone: 'Asia/Kolkata',
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+        hour12: false,
+      }).formatToParts(dateObj);
 
-    const defaultFromDate = formatISTDate(pastDateObj);
-    const defaultToDate = formatISTDate(tomorrowDateObj);
+      const map = {};
+      parts.forEach((p) => {
+        map[p.type] = p.value;
+      });
 
-    const payload = {
-      securityId: String(securityId),
-      exchangeSegment: exchangeSegment,
-      instrument: instrument,
-      expiryCode: 0,
-      oi: false,
-      fromDate: fromDate || defaultFromDate,
-      toDate: toDate || defaultToDate, // Tomorrow's date includes today's candle
+      return `${map.year}-${map.month}-${map.day} ${map.hour}:${map.minute}:${map.second}`;
     };
 
-    const dhanRes = await fetch('https://api.dhan.co/v2/charts/historical', {
+    const now = new Date();
+    const isDaily = interval.toUpperCase() === '1D' || interval.toUpperCase() === 'D';
+
+    let dhanEndpoint = '';
+    let payload = {};
+
+    if (isDaily) {
+      // ---------------- 1. DAILY HISTORICAL CANDLES ----------------
+      dhanEndpoint = 'https://api.dhan.co/v2/charts/historical';
+      const past30Days = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+      const tomorrow = new Date(now.getTime() + 24 * 60 * 60 * 1000);
+
+      payload = {
+        securityId: String(securityId),
+        exchangeSegment: exchangeSegment,
+        instrument: instrument,
+        expiryCode: 0,
+        oi: false,
+        fromDate: fromDate || formatISTDate(past30Days),
+        toDate: toDate || formatISTDate(tomorrow), // Tomorrow makes sure today's session is inclusive
+      };
+    } else {
+      // ---------------- 2. INTRADAY CANDLES (1m, 5m, 15m, 25m, 60m) ----------------
+      dhanEndpoint = 'https://api.dhan.co/v2/charts/intraday';
+      // Default intraday range: past 5 trading days
+      const past5Days = new Date(now.getTime() - 5 * 24 * 60 * 60 * 1000);
+
+      payload = {
+        securityId: String(securityId),
+        exchangeSegment: exchangeSegment,
+        instrument: instrument,
+        interval: String(interval), // '1', '5', '15', '25', '60'
+        oi: false,
+        fromDate: fromDate || `${formatISTDate(past5Days)} 09:15:00`,
+        toDate: toDate || formatISTDateTime(now),
+      };
+    }
+
+    const dhanRes = await fetch(dhanEndpoint, {
       method: 'POST',
       headers: {
         'access-token': ACCESS_TOKEN,
@@ -96,9 +138,12 @@ app.get('/api/charts/historical', async (req, res) => {
     const timestamps = data.timestamp || data.start_Time;
     if (data && data.open && data.open.length > 0 && timestamps) {
       const bars = timestamps.map((time, idx) => {
-        const epochSeconds = typeof time === 'number'
-          ? (time > 9999999999 ? Math.floor(time / 1000) : time)
-          : Math.floor(new Date(time).getTime() / 1000);
+        const epochSeconds =
+          typeof time === 'number'
+            ? time > 9999999999
+              ? Math.floor(time / 1000)
+              : time
+            : Math.floor(new Date(time).getTime() / 1000);
 
         return {
           time: epochSeconds,
@@ -110,9 +155,9 @@ app.get('/api/charts/historical', async (req, res) => {
         };
       });
 
-      // Sort chronological ascending order for Lightweight Charts
+      // Sort ascending by time for Lightweight Charts
       bars.sort((a, b) => a.time - b.time);
-      return res.json({ success: true, count: bars.length, bars });
+      return res.json({ success: true, count: bars.length, interval, bars });
     }
 
     return res.status(404).json({
