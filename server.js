@@ -30,8 +30,7 @@ if (!CLIENT_ID || !ACCESS_TOKEN) {
 }
 
 // ==========================================
-// REST Route: Historical & Intraday Data Proxy
-// Supports: interval=1D (Daily) OR interval=1, 5, 15, 25, 60 (Intraday)
+// REST Route: Historical & Intraday Data Proxy with Infinite Scroll Support
 // ==========================================
 app.get('/api/charts/historical', async (req, res) => {
   try {
@@ -39,7 +38,7 @@ app.get('/api/charts/historical', async (req, res) => {
       securityId,
       exchangeSegment = 'NSE_EQ',
       instrument = 'EQUITY',
-      interval = '1D', // Default: 1D. Also accepts: '1', '5', '15', '25', '60'
+      interval = '1D', // '1D', '1', '5', '15', '25', '60'
       fromDate,
       toDate,
     } = req.query;
@@ -52,7 +51,7 @@ app.get('/api/charts/historical', async (req, res) => {
       return res.status(500).json({ error: 'Dhan ACCESS_TOKEN is not configured on server' });
     }
 
-    // Helper: Format date to YYYY-MM-DD in IST (Asia/Kolkata)
+    // Helper: Format date to YYYY-MM-DD in IST
     const formatISTDate = (dateObj) => {
       return new Intl.DateTimeFormat('en-CA', {
         timeZone: 'Asia/Kolkata',
@@ -92,7 +91,9 @@ app.get('/api/charts/historical', async (req, res) => {
     if (isDaily) {
       // ---------------- 1. DAILY HISTORICAL CANDLES ----------------
       dhanEndpoint = 'https://api.dhan.co/v2/charts/historical';
-      const past30Days = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+      
+      // डिफ़ॉल्ट: पूरा 2 साल (730 दिन) का इतिहास
+      const past2Years = new Date(now.getTime() - 730 * 24 * 60 * 60 * 1000);
       const tomorrow = new Date(now.getTime() + 24 * 60 * 60 * 1000);
 
       payload = {
@@ -101,22 +102,24 @@ app.get('/api/charts/historical', async (req, res) => {
         instrument: instrument,
         expiryCode: 0,
         oi: false,
-        fromDate: fromDate || formatISTDate(past30Days),
-        toDate: toDate || formatISTDate(tomorrow), // Tomorrow makes sure today's session is inclusive
+        fromDate: fromDate || formatISTDate(past2Years),
+        toDate: toDate || formatISTDate(tomorrow),
       };
     } else {
-      // ---------------- 2. INTRADAY CANDLES (1m, 5m, 15m, 25m, 60m) ----------------
+      // ---------------- 2. INTRADAY CANDLES (1m, 5m, 15m, 60m) ----------------
       dhanEndpoint = 'https://api.dhan.co/v2/charts/intraday';
-      // Default intraday range: past 5 trading days
-      const past5Days = new Date(now.getTime() - 5 * 24 * 60 * 60 * 1000);
+
+      // 1-मिनट के लिए 10 दिन, बाकी 5m/15m के लिए पहले राउंड में 30 दिन
+      const daysBack = interval === '1' ? 10 : 30;
+      const pastDays = new Date(now.getTime() - daysBack * 24 * 60 * 60 * 1000);
 
       payload = {
         securityId: String(securityId),
         exchangeSegment: exchangeSegment,
         instrument: instrument,
-        interval: String(interval), // '1', '5', '15', '25', '60'
+        interval: String(interval),
         oi: false,
-        fromDate: fromDate || `${formatISTDate(past5Days)} 09:15:00`,
+        fromDate: fromDate || `${formatISTDate(pastDays)} 09:15:00`,
         toDate: toDate || formatISTDateTime(now),
       };
     }
@@ -134,7 +137,6 @@ app.get('/api/charts/historical', async (req, res) => {
 
     const data = await dhanRes.json();
 
-    // Dhan returns timestamp or start_Time array
     const timestamps = data.timestamp || data.start_Time;
     if (data && data.open && data.open.length > 0 && timestamps) {
       const bars = timestamps.map((time, idx) => {
@@ -155,7 +157,6 @@ app.get('/api/charts/historical', async (req, res) => {
         };
       });
 
-      // Sort ascending by time for Lightweight Charts
       bars.sort((a, b) => a.time - b.time);
       return res.json({ success: true, count: bars.length, interval, bars });
     }
@@ -183,7 +184,7 @@ const DHAN_WS_URL = `wss://api-feed.dhan.co?version=2&token=${encodeURIComponent
 )}&clientId=${encodeURIComponent(CLIENT_ID || '')}&authType=2`;
 
 let dhanWs = null;
-const activeSubscriptions = new Map(); // securityId -> subscriber count
+const activeSubscriptions = new Map();
 
 // ------------------------------------------
 // 1. Dhan WebSocket Manager
@@ -199,7 +200,6 @@ function connectDhan() {
   dhanWs.on('open', () => {
     console.log('[Dhan] Connected successfully.');
 
-    // Handshake packet (RequestCode 11)
     dhanWs.send(
       JSON.stringify({
         RequestCode: 11,
@@ -208,7 +208,6 @@ function connectDhan() {
       })
     );
 
-    // अगर रीकनेक्ट हुआ है, तो पहले से एक्टिव सिंबल्स दोबारा सब्सक्राइब करें
     if (activeSubscriptions.size > 0) {
       const instruments = Array.from(activeSubscriptions.keys()).map((id) => ({
         ExchangeSegment: 'NSE_EQ',
@@ -219,10 +218,8 @@ function connectDhan() {
   });
 
   dhanWs.on('message', (data) => {
-    // Ack / Handshake JSON strings
     if (typeof data === 'string' || data[0] === 0x7b) return;
 
-    // Binary Tick Data Parsing
     const buffer = Buffer.from(data);
     const responseCode = buffer.readUInt8(0);
 
@@ -238,7 +235,6 @@ function connectDhan() {
         timestamp: Date.now(),
       };
 
-      // संबंधित रूम को टिक ब्रॉडकास्ट करें
       io.to(`stock:${securityId}`).emit('tick', tick);
     }
   });
@@ -257,7 +253,7 @@ function sendSubscription(requestCode, instrumentList) {
   if (dhanWs && dhanWs.readyState === WsClient.OPEN && instrumentList.length > 0) {
     dhanWs.send(
       JSON.stringify({
-        RequestCode: requestCode, // 15 = Subscribe, 16 = Unsubscribe
+        RequestCode: requestCode,
         InstrumentCount: instrumentList.length,
         InstrumentList: instrumentList,
       })
@@ -268,12 +264,11 @@ function sendSubscription(requestCode, instrumentList) {
 connectDhan();
 
 // ------------------------------------------
-// 2. Client (Lovable / Browser) Manager
+// 2. Client Manager
 // ------------------------------------------
 io.on('connection', (socket) => {
   console.log(`[Client Connected] Socket ID: ${socket.id}`);
 
-  // यूजर ने स्टॉक वॉचलिस्ट में खोला / चार्ट लोड किया
   socket.on('subscribe', ({ securityId, segment = 'NSE_EQ' }) => {
     if (!securityId) return;
 
@@ -283,14 +278,12 @@ io.on('connection', (socket) => {
     const currentCount = activeSubscriptions.get(securityId) || 0;
     activeSubscriptions.set(securityId, currentCount + 1);
 
-    // केवल तभी सब्सक्राइब भेजें जब पहला यूजर इस स्टॉक को देख रहा हो
     if (currentCount === 0) {
       sendSubscription(15, [{ ExchangeSegment: segment, SecurityId: securityId.toString() }]);
       console.log(`[Subscribed Dhan] SecurityId: ${securityId}`);
     }
   });
 
-  // यूजर ने स्टॉक बदला या टैब बंद किया
   socket.on('unsubscribe', ({ securityId, segment = 'NSE_EQ' }) => {
     if (!securityId) return;
 
@@ -312,7 +305,6 @@ io.on('connection', (socket) => {
   });
 });
 
-// Railway PORT binding on 0.0.0.0
 const PORT = process.env.PORT || 4000;
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 Gateway Server running on port ${PORT}`);
