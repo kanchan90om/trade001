@@ -4,7 +4,7 @@ const WsClient = require('ws');
 // अपनी Dhan क्रेडेंशियल्स यहाँ भरें
 // ==========================================
 const CLIENT_ID = '1110828273';   // जैसे: '1100123456'
-const ACCESS_TOKEN = 'eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJ1c2VyUmVnaW9uIjoiUjEiLCJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzk0NDU1NjA0LCJpYXQiOjE3OTQzNjkyMDQsInRva2VuQ29uc3VtZXJUeXBlIjoiU0VMRiIsIndlYmhvb2tVcmwiOiIiLCJkaGFuQ2xpZW50SWQiOiIxMTEwODI4MjczIn0.OBDjAUMQbCeuXKenpT0ROiH6S2SAz_oHBnpLhwaIFWP0KrYbvK8KmaPo0qCCqBCE0XjJ-pDEhSf0cGPvMURU4Q'; // आपका 24 घंटे वाला Access Token
+const ACCESS_TOKEN = 'eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJ1c2VyUmVnaW9uIjoiUjEiLCJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzk0NTQzMjk0LCJpYXQiOjE3OTQ0NTY4OTQsInRva2VuQ29uc3VtZXJUeXBlIjoiU0VMRiIsIndlYmhvb2tVcmwiOiIiLCJkaGFuQ2xpZW50SWQiOiIxMTEwODI4MjczIn0.f-ZZ9F1lFaA5dVnFZTf_ZV1D4iDRpodBD0uwd3h53V-I5fvShZnt5kglmXiCzsZbAqiIYU4lYEfjICe7zqU3OQ'; // आपका 24 घंटे वाला Access Token
 
 // Dhan v2 WebSocket URL with Query Parameters (यही मिसिंग था)
 const DHAN_WS_URL = `wss://api-feed.dhan.co?version=2&token=${encodeURIComponent(ACCESS_TOKEN)}&clientId=${encodeURIComponent(CLIENT_ID)}&authType=2`;
