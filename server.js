@@ -9,25 +9,31 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// ==========================================
+// Credentials from Environment Variables (Trimmed)
+// ==========================================
+const CLIENT_ID = (process.env.DHAN_CLIENT_ID || '').trim();
+const ACCESS_TOKEN = (process.env.DHAN_ACCESS_TOKEN || '').trim();
+
+if (!CLIENT_ID || !ACCESS_TOKEN) {
+  console.error('⚠️ [CRITICAL] DHAN_CLIENT_ID or DHAN_ACCESS_TOKEN is missing in environment variables!');
+}
+
+let dhanWs = null;
+let dhanConnected = false;
+// Map: securityId -> { count: number, segment: string }
+const activeSubscriptions = new Map();
+
 // Railway / Uptime Health Check endpoint
 app.get('/', (req, res) => {
   res.json({
     status: 'running',
+    dhanWsConnected: dhanConnected,
     message: 'Dhan WebSocket Gateway is active',
     activeSubscribers: activeSubscriptions.size,
     timestamp: new Date().toISOString(),
   });
 });
-
-// ==========================================
-// Credentials from Environment Variables
-// ==========================================
-const CLIENT_ID = process.env.DHAN_CLIENT_ID;
-const ACCESS_TOKEN = process.env.DHAN_ACCESS_TOKEN;
-
-if (!CLIENT_ID || !ACCESS_TOKEN) {
-  console.error('⚠️ [CRITICAL] DHAN_CLIENT_ID or DHAN_ACCESS_TOKEN is missing in environment variables!');
-}
 
 // ==========================================
 // REST Route: Historical & Intraday Data Proxy with Infinite Scroll Support
@@ -91,8 +97,8 @@ app.get('/api/charts/historical', async (req, res) => {
     if (isDaily) {
       // ---------------- 1. DAILY HISTORICAL CANDLES ----------------
       dhanEndpoint = 'https://api.dhan.co/v2/charts/historical';
-      
-      // डिफ़ॉल्ट: पूरा 2 साल (730 दिन) का इतिहास
+
+      // Default: 2 years (730 days) history
       const past2Years = new Date(now.getTime() - 730 * 24 * 60 * 60 * 1000);
       const tomorrow = new Date(now.getTime() + 24 * 60 * 60 * 1000);
 
@@ -106,10 +112,10 @@ app.get('/api/charts/historical', async (req, res) => {
         toDate: toDate || formatISTDate(tomorrow),
       };
     } else {
-      // ---------------- 2. INTRADAY CANDLES (1m, 5m, 15m, 60m) ----------------
+      // ---------------- 2. INTRADAY CANDLES (1m, 5m, 15m, 25m, 60m) ----------------
       dhanEndpoint = 'https://api.dhan.co/v2/charts/intraday';
 
-      // 1-मिनट के लिए 10 दिन, बाकी 5m/15m के लिए पहले राउंड में 30 दिन
+      // 10 days for 1m, 30 days for 5m/15m/25m/60m
       const daysBack = interval === '1' ? 10 : 30;
       const pastDays = new Date(now.getTime() - daysBack * 24 * 60 * 60 * 1000);
 
@@ -128,7 +134,7 @@ app.get('/api/charts/historical', async (req, res) => {
       method: 'POST',
       headers: {
         'access-token': ACCESS_TOKEN,
-        'client-id': CLIENT_ID || '',
+        'client-id': CLIENT_ID,
         'Content-Type': 'application/json',
         Accept: 'application/json',
       },
@@ -180,84 +186,103 @@ const io = new Server(server, {
 });
 
 const DHAN_WS_URL = `wss://api-feed.dhan.co?version=2&token=${encodeURIComponent(
-  ACCESS_TOKEN || ''
-)}&clientId=${encodeURIComponent(CLIENT_ID || '')}&authType=2`;
-
-let dhanWs = null;
-const activeSubscriptions = new Map();
+  ACCESS_TOKEN
+)}&clientId=${encodeURIComponent(CLIENT_ID)}&authType=2`;
 
 // ------------------------------------------
-// 1. Dhan WebSocket Manager
+// 1. Dhan WebSocket Manager (v2 Native Auth)
 // ------------------------------------------
 function connectDhan() {
   if (!CLIENT_ID || !ACCESS_TOKEN) return;
 
   console.log('[Dhan] Connecting to Live Feed...');
-  dhanWs = new WsClient(DHAN_WS_URL, {
-    headers: { 'User-Agent': 'DhanHQ-NodeClient/2.0' },
+  dhanWs = new WsClient(DHAN_WS_URL);
+
+  // Capture exact HTTP status if Dhan rejects the WebSocket handshake
+  dhanWs.on('unexpected-response', (req, res) => {
+    let body = '';
+    res.on('data', (chunk) => (body += chunk));
+    res.on('end', () => {
+      console.error(
+        `[Dhan Handshake Rejected] HTTP ${res.statusCode} ${res.statusMessage} | Body: ${body}`
+      );
+    });
   });
 
   dhanWs.on('open', () => {
-    console.log('[Dhan] Connected successfully.');
+    dhanConnected = true;
+    console.log('[Dhan] ✅ Connected to Live Feed (v2).');
 
-    dhanWs.send(
-      JSON.stringify({
-        RequestCode: 11,
-        ClientId: CLIENT_ID,
-        Token: ACCESS_TOKEN,
-      })
-    );
-
+    // Resubscribe all active symbols with their exact segments (No RequestCode 11 in v2)
     if (activeSubscriptions.size > 0) {
-      const instruments = Array.from(activeSubscriptions.keys()).map((id) => ({
-        ExchangeSegment: 'NSE_EQ',
-        SecurityId: id.toString(),
+      const instruments = Array.from(activeSubscriptions.entries()).map(([id, info]) => ({
+        ExchangeSegment: info.segment || 'NSE_EQ',
+        SecurityId: String(id),
       }));
       sendSubscription(15, instruments);
     }
   });
 
+  let tickLogCount = 0;
+
   dhanWs.on('message', (data) => {
-    if (typeof data === 'string' || data[0] === 0x7b) return;
+    if (typeof data === 'string' || data[0] === 0x7b) {
+      console.log('[Dhan Text Msg]:', data.toString());
+      return;
+    }
 
     const buffer = Buffer.from(data);
+    if (buffer.length < 12) return;
+
     const responseCode = buffer.readUInt8(0);
 
+    // 2 = Ticker, 4 = Quote, 8 = Full Market Depth
     if (responseCode === 2 || responseCode === 4 || responseCode === 8) {
-      const exchangeSegment = buffer.readUInt8(1);
+      const exchangeSegment = buffer.readUInt8(3);
       const securityId = buffer.readInt32LE(4);
       const ltp = buffer.readFloatLE(8);
 
+      if (!ltp || isNaN(ltp)) return;
+
       const tick = {
-        securityId: securityId.toString(),
+        securityId: String(securityId),
         segment: exchangeSegment,
         ltp: Number(ltp.toFixed(2)),
         timestamp: Date.now(),
       };
 
+      if (tickLogCount % 25 === 0) {
+        console.log(`[LIVE TICK] ID: ${tick.securityId} | LTP: ₹${tick.ltp}`);
+      }
+      tickLogCount++;
+
       io.to(`stock:${securityId}`).emit('tick', tick);
+    } else if (responseCode === 50) {
+      const disconnectCode = buffer.readInt16LE(8);
+      console.error(`[Dhan] Disconnect Packet Received. Code: ${disconnectCode}`);
     }
   });
 
   dhanWs.on('error', (err) => {
-    console.error('[Dhan Error]', err.message);
+    console.error('[Dhan WS Error]:', err.message || err);
   });
 
-  dhanWs.on('close', (code, reason) => {
-    console.log(`[Dhan] Disconnected (Code: ${code}). Reconnecting in 3 seconds...`);
-    setTimeout(connectDhan, 3000);
+  dhanWs.on('close', (code) => {
+    dhanConnected = false;
+    console.log(`[Dhan] Disconnected (Code: ${code}). Reconnecting in 5 seconds...`);
+    setTimeout(connectDhan, 5000);
   });
 }
 
 function sendSubscription(requestCode, instrumentList) {
   if (dhanWs && dhanWs.readyState === WsClient.OPEN && instrumentList.length > 0) {
-    dhanWs.send(
-      JSON.stringify({
-        RequestCode: requestCode,
-        InstrumentCount: instrumentList.length,
-        InstrumentList: instrumentList,
-      })
-    );
+    const payload = {
+      RequestCode: requestCode,
+      InstrumentCount: instrumentList.length,
+      InstrumentList: instrumentList,
+    };
+    dhanWs.send(JSON.stringify(payload));
+    console.log('[Dhan WS Sent]:', JSON.stringify(payload));
   }
 }
 
@@ -271,32 +296,36 @@ io.on('connection', (socket) => {
 
   socket.on('subscribe', ({ securityId, segment = 'NSE_EQ' }) => {
     if (!securityId) return;
-
-    const room = `stock:${securityId}`;
+    const idStr = String(securityId);
+    const room = `stock:${idStr}`;
     socket.join(room);
 
-    const currentCount = activeSubscriptions.get(securityId) || 0;
-    activeSubscriptions.set(securityId, currentCount + 1);
-
-    if (currentCount === 0) {
-      sendSubscription(15, [{ ExchangeSegment: segment, SecurityId: securityId.toString() }]);
-      console.log(`[Subscribed Dhan] SecurityId: ${securityId}`);
+    const existing = activeSubscriptions.get(idStr);
+    if (!existing) {
+      activeSubscriptions.set(idStr, { count: 1, segment });
+      sendSubscription(15, [{ ExchangeSegment: segment, SecurityId: idStr }]);
+      console.log(`[Subscribed Dhan] SecurityId: ${idStr} (${segment})`);
+    } else {
+      existing.count += 1;
+      existing.segment = segment;
     }
   });
 
   socket.on('unsubscribe', ({ securityId, segment = 'NSE_EQ' }) => {
     if (!securityId) return;
-
-    const room = `stock:${securityId}`;
+    const idStr = String(securityId);
+    const room = `stock:${idStr}`;
     socket.leave(room);
 
-    const currentCount = activeSubscriptions.get(securityId) || 0;
-    if (currentCount <= 1) {
-      activeSubscriptions.delete(securityId);
-      sendSubscription(16, [{ ExchangeSegment: segment, SecurityId: securityId.toString() }]);
-      console.log(`[Unsubscribed Dhan] SecurityId: ${securityId}`);
-    } else {
-      activeSubscriptions.set(securityId, currentCount - 1);
+    const existing = activeSubscriptions.get(idStr);
+    if (existing) {
+      if (existing.count <= 1) {
+        activeSubscriptions.delete(idStr);
+        sendSubscription(16, [{ ExchangeSegment: existing.segment || segment, SecurityId: idStr }]);
+        console.log(`[Unsubscribed Dhan] SecurityId: ${idStr}`);
+      } else {
+        existing.count -= 1;
+      }
     }
   });
 
