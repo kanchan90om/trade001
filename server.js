@@ -288,6 +288,10 @@ function connectDhan() {
     if (res.statusCode === 401 || res.statusCode === 403) {
       console.log('🔄 [Auth] WebSocket auth rejected. Regenerating token...');
       await refreshDhanAccessToken(false);
+      dhanWs = new WsClient(wsUrl, {
+    family: 4, // Strictly use IPv4
+    handshakeTimeout: 15000, // 15s timeout instead of failing early
+  });
     }
   });
 
