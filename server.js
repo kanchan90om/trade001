@@ -4,28 +4,74 @@ const http = require('http');
 const { Server } = require('socket.io');
 const WsClient = require('ws');
 const cors = require('cors');
+const { authenticator } = require('otplib');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
 // ==========================================
-// Credentials from Environment Variables (Trimmed)
+// Credentials from Environment Variables
 // ==========================================
 const CLIENT_ID = (process.env.DHAN_CLIENT_ID || '').trim();
-const ACCESS_TOKEN = (process.env.DHAN_ACCESS_TOKEN || '').trim();
+const DHAN_PIN = (process.env.DHAN_PIN || '').trim();
+const TOTP_SECRET = (process.env.DHAN_TOTP_SECRET || '').trim();
 
-if (!CLIENT_ID || !ACCESS_TOKEN) {
-  console.error('⚠️ [CRITICAL] DHAN_CLIENT_ID or DHAN_ACCESS_TOKEN is missing in environment variables!');
-}
+// Holds the active token in memory (falls back to env token if TOTP isn't set yet)
+let activeAccessToken = (process.env.DHAN_ACCESS_TOKEN || '').trim();
+let tokenExpiryTime = null;
 
 let dhanWs = null;
 let dhanConnected = false;
-// Map: securityId -> { count: number, segment: string }
 const activeSubscriptions = new Map();
 
 // ==========================================
-// Helpers: Segment & Instrument Normalization for Dhan v2
+// Automatic Dhan Access Token Generator (TOTP + PIN)
+// ==========================================
+async function refreshDhanAccessToken(reconnectSocket = true) {
+  if (!CLIENT_ID || !DHAN_PIN || !TOTP_SECRET) {
+    console.warn('⚠️ [Auth] DHAN_PIN or DHAN_TOTP_SECRET missing; using static DHAN_ACCESS_TOKEN.');
+    return activeAccessToken;
+  }
+
+  try {
+    const totpCode = authenticator.generate(TOTP_SECRET);
+    const url = `https://auth.dhan.co/app/generateAccessToken?dhanClientId=${encodeURIComponent(
+      CLIENT_ID
+    )}&pin=${encodeURIComponent(DHAN_PIN)}&totp=${encodeURIComponent(totpCode)}`;
+
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { Accept: 'application/json' },
+    });
+
+    const data = await response.json();
+
+    if (data && data.accessToken) {
+      activeAccessToken = data.accessToken.trim();
+      tokenExpiryTime = data.expiryTime || new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+      console.log(`✅ [Auth] Auto-generated fresh Dhan Access Token. Valid until: ${tokenExpiryTime}`);
+
+      if (reconnectSocket) {
+        if (dhanWs) {
+          dhanWs.terminate(); // Triggers clean reconnect with new token
+        } else {
+          connectDhan();
+        }
+      }
+      return activeAccessToken;
+    } else {
+      console.error('❌ [Auth] Failed to auto-generate token:', data);
+      return activeAccessToken;
+    }
+  } catch (err) {
+    console.error('❌ [Auth] Token generation error:', err.message);
+    return activeAccessToken;
+  }
+}
+
+// ==========================================
+// Helpers: Segment & Instrument Normalization
 // ==========================================
 function normalizeSegment(seg) {
   if (!seg) return 'NSE_EQ';
@@ -48,19 +94,20 @@ function resolveInstrument(segment, queryInstrument) {
   return 'EQUITY';
 }
 
-// Railway / Uptime Health Check endpoint
+// Health Check Endpoint
 app.get('/', (req, res) => {
   res.json({
     status: 'running',
     dhanWsConnected: dhanConnected,
-    message: 'Dhan WebSocket Gateway is active',
+    autoAuthEnabled: Boolean(CLIENT_ID && DHAN_PIN && TOTP_SECRET),
+    tokenExpiresAt: tokenExpiryTime,
     activeSubscribers: activeSubscriptions.size,
     timestamp: new Date().toISOString(),
   });
 });
 
 // ==========================================
-// REST Route: Historical & Intraday Data Proxy (Equities, Indices & F&O)
+// REST Route: Historical & Intraday Data Proxy
 // ==========================================
 app.get('/api/charts/historical', async (req, res) => {
   try {
@@ -68,7 +115,7 @@ app.get('/api/charts/historical', async (req, res) => {
       securityId,
       exchangeSegment = 'NSE_EQ',
       instrument,
-      interval = '1D', // '1D', '1', '5', '15', '25', '60'
+      interval = '1D',
       fromDate,
       toDate,
     } = req.query;
@@ -77,8 +124,8 @@ app.get('/api/charts/historical', async (req, res) => {
       return res.status(400).json({ error: 'securityId parameter is required' });
     }
 
-    if (!ACCESS_TOKEN) {
-      return res.status(500).json({ error: 'Dhan ACCESS_TOKEN is not configured on server' });
+    if (!activeAccessToken) {
+      await refreshDhanAccessToken(false);
     }
 
     const cleanSegment = normalizeSegment(exchangeSegment);
@@ -86,17 +133,14 @@ app.get('/api/charts/historical', async (req, res) => {
     const includeOI =
       cleanSegment === 'NSE_FNO' || cleanSegment === 'BSE_FNO' || cleanSegment === 'MCX_COMM';
 
-    // Helper: Format date to YYYY-MM-DD in IST
-    const formatISTDate = (dateObj) => {
-      return new Intl.DateTimeFormat('en-CA', {
+    const formatISTDate = (dateObj) =>
+      new Intl.DateTimeFormat('en-CA', {
         timeZone: 'Asia/Kolkata',
         year: 'numeric',
         month: '2-digit',
         day: '2-digit',
       }).format(dateObj);
-    };
 
-    // Helper: Format date & time to YYYY-MM-DD HH:mm:ss in IST
     const formatISTDateTime = (dateObj) => {
       const parts = new Intl.DateTimeFormat('en-GB', {
         timeZone: 'Asia/Kolkata',
@@ -110,10 +154,7 @@ app.get('/api/charts/historical', async (req, res) => {
       }).formatToParts(dateObj);
 
       const map = {};
-      parts.forEach((p) => {
-        map[p.type] = p.value;
-      });
-
+      parts.forEach((p) => (map[p.type] = p.value));
       return `${map.year}-${map.month}-${map.day} ${map.hour}:${map.minute}:${map.second}`;
     };
 
@@ -124,10 +165,7 @@ app.get('/api/charts/historical', async (req, res) => {
     let payload = {};
 
     if (isDaily) {
-      // ---------------- 1. DAILY HISTORICAL CANDLES ----------------
       dhanEndpoint = 'https://api.dhan.co/v2/charts/historical';
-
-      // Default: 2 years (730 days) history
       const past2Years = new Date(now.getTime() - 730 * 24 * 60 * 60 * 1000);
       const tomorrow = new Date(now.getTime() + 24 * 60 * 60 * 1000);
 
@@ -141,10 +179,7 @@ app.get('/api/charts/historical', async (req, res) => {
         toDate: toDate || formatISTDate(tomorrow),
       };
     } else {
-      // ---------------- 2. INTRADAY CANDLES (1m, 5m, 15m, 25m, 60m) ----------------
       dhanEndpoint = 'https://api.dhan.co/v2/charts/intraday';
-
-      // 10 days for 1m, 30 days for 5m/15m/25m/60m
       const daysBack = interval === '1' ? 10 : 30;
       const pastDays = new Date(now.getTime() - daysBack * 24 * 60 * 60 * 1000);
 
@@ -159,18 +194,28 @@ app.get('/api/charts/historical', async (req, res) => {
       };
     }
 
-    const dhanRes = await fetch(dhanEndpoint, {
-      method: 'POST',
-      headers: {
-        'access-token': ACCESS_TOKEN,
-        'client-id': CLIENT_ID,
-        'Content-Type': 'application/json',
-        Accept: 'application/json',
-      },
-      body: JSON.stringify(payload),
-    });
+    const executeDhanFetch = async (token) => {
+      const response = await fetch(dhanEndpoint, {
+        method: 'POST',
+        headers: {
+          'access-token': token,
+          'client-id': CLIENT_ID,
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+        },
+        body: JSON.stringify(payload),
+      });
+      return response.json();
+    };
 
-    const data = await dhanRes.json();
+    let data = await executeDhanFetch(activeAccessToken);
+
+    // Auto-retry once if token expired (DH-901)
+    if (data && data.errorCode === 'DH-901') {
+      console.log('🔄 [Auth] Token expired during REST call. Auto-refreshing...');
+      const newToken = await refreshDhanAccessToken(true);
+      data = await executeDhanFetch(newToken);
+    }
 
     const timestamps = data.timestamp || data.start_Time;
     if (data && data.open && data.open.length > 0 && timestamps) {
@@ -223,35 +268,31 @@ const io = new Server(server, {
   },
 });
 
-const DHAN_WS_URL = `wss://api-feed.dhan.co?version=2&token=${encodeURIComponent(
-  ACCESS_TOKEN
-)}&clientId=${encodeURIComponent(CLIENT_ID)}&authType=2`;
-
 // ------------------------------------------
-// 1. Dhan WebSocket Manager (v2 Native Auth)
+// 1. Dhan WebSocket Manager
 // ------------------------------------------
 function connectDhan() {
-  if (!CLIENT_ID || !ACCESS_TOKEN) return;
+  if (!CLIENT_ID || !activeAccessToken) return;
+
+  const wsUrl = `wss://api-feed.dhan.co?version=2&token=${encodeURIComponent(
+    activeAccessToken
+  )}&clientId=${encodeURIComponent(CLIENT_ID)}&authType=2`;
 
   console.log('[Dhan] Connecting to Live Feed...');
-  dhanWs = new WsClient(DHAN_WS_URL);
+  dhanWs = new WsClient(wsUrl);
 
-  // Capture exact HTTP status if Dhan rejects the WebSocket handshake
-  dhanWs.on('unexpected-response', (req, res) => {
-    let body = '';
-    res.on('data', (chunk) => (body += chunk));
-    res.on('end', () => {
-      console.error(
-        `[Dhan Handshake Rejected] HTTP ${res.statusCode} ${res.statusMessage} | Body: ${body}`
-      );
-    });
+  dhanWs.on('unexpected-response', async (req, res) => {
+    console.error(`[Dhan Handshake Rejected] HTTP ${res.statusCode} ${res.statusMessage}`);
+    if (res.statusCode === 401 || res.statusCode === 403) {
+      console.log('🔄 [Auth] WebSocket auth rejected. Regenerating token...');
+      await refreshDhanAccessToken(false);
+    }
   });
 
   dhanWs.on('open', () => {
     dhanConnected = true;
     console.log('[Dhan] ✅ Connected to Live Feed (v2).');
 
-    // Resubscribe all active symbols with their exact segments (No RequestCode 11 in v2)
     if (activeSubscriptions.size > 0) {
       const instruments = Array.from(activeSubscriptions.entries()).map(([id, info]) => ({
         ExchangeSegment: info.segment || 'NSE_EQ',
@@ -261,20 +302,13 @@ function connectDhan() {
     }
   });
 
-  let tickLogCount = 0;
-
   dhanWs.on('message', (data) => {
-    if (typeof data === 'string' || data[0] === 0x7b) {
-      console.log('[Dhan Text Msg]:', data.toString());
-      return;
-    }
+    if (typeof data === 'string' || data[0] === 0x7b) return;
 
     const buffer = Buffer.from(data);
     if (buffer.length < 12) return;
 
     const responseCode = buffer.readUInt8(0);
-
-    // 2 = Ticker, 4 = Quote, 8 = Full Market Depth
     if (responseCode === 2 || responseCode === 4 || responseCode === 8) {
       const exchangeSegment = buffer.readUInt8(3);
       const securityId = buffer.readInt32LE(4);
@@ -282,22 +316,12 @@ function connectDhan() {
 
       if (!ltp || isNaN(ltp)) return;
 
-      const tick = {
+      io.to(`stock:${securityId}`).emit('tick', {
         securityId: String(securityId),
         segment: exchangeSegment,
         ltp: Number(ltp.toFixed(2)),
         timestamp: Date.now(),
-      };
-
-      if (tickLogCount % 25 === 0) {
-        console.log(`[LIVE TICK] ID: ${tick.securityId} | LTP: ₹${tick.ltp}`);
-      }
-      tickLogCount++;
-
-      io.to(`stock:${securityId}`).emit('tick', tick);
-    } else if (responseCode === 50) {
-      const disconnectCode = buffer.readInt16LE(8);
-      console.error(`[Dhan] Disconnect Packet Received. Code: ${disconnectCode}`);
+      });
     }
   });
 
@@ -314,36 +338,30 @@ function connectDhan() {
 
 function sendSubscription(requestCode, instrumentList) {
   if (dhanWs && dhanWs.readyState === WsClient.OPEN && instrumentList.length > 0) {
-    const payload = {
-      RequestCode: requestCode,
-      InstrumentCount: instrumentList.length,
-      InstrumentList: instrumentList,
-    };
-    dhanWs.send(JSON.stringify(payload));
-    console.log('[Dhan WS Sent]:', JSON.stringify(payload));
+    dhanWs.send(
+      JSON.stringify({
+        RequestCode: requestCode,
+        InstrumentCount: instrumentList.length,
+        InstrumentList: instrumentList,
+      })
+    );
   }
 }
-
-connectDhan();
 
 // ------------------------------------------
 // 2. Client Manager
 // ------------------------------------------
 io.on('connection', (socket) => {
-  console.log(`[Client Connected] Socket ID: ${socket.id}`);
-
   socket.on('subscribe', ({ securityId, segment = 'NSE_EQ' }) => {
     if (!securityId) return;
     const idStr = String(securityId);
     const cleanSegment = normalizeSegment(segment);
-    const room = `stock:${idStr}`;
-    socket.join(room);
+    socket.join(`stock:${idStr}`);
 
     const existing = activeSubscriptions.get(idStr);
     if (!existing) {
       activeSubscriptions.set(idStr, { count: 1, segment: cleanSegment });
       sendSubscription(15, [{ ExchangeSegment: cleanSegment, SecurityId: idStr }]);
-      console.log(`[Subscribed Dhan] SecurityId: ${idStr} (${cleanSegment})`);
     } else {
       existing.count += 1;
       existing.segment = cleanSegment;
@@ -354,27 +372,32 @@ io.on('connection', (socket) => {
     if (!securityId) return;
     const idStr = String(securityId);
     const cleanSegment = normalizeSegment(segment);
-    const room = `stock:${idStr}`;
-    socket.leave(room);
+    socket.leave(`stock:${idStr}`);
 
     const existing = activeSubscriptions.get(idStr);
     if (existing) {
       if (existing.count <= 1) {
         activeSubscriptions.delete(idStr);
         sendSubscription(16, [{ ExchangeSegment: existing.segment || cleanSegment, SecurityId: idStr }]);
-        console.log(`[Unsubscribed Dhan] SecurityId: ${idStr}`);
       } else {
         existing.count -= 1;
       }
     }
   });
-
-  socket.on('disconnect', () => {
-    console.log(`[Client Disconnected] Socket ID: ${socket.id}`);
-  });
 });
 
+// ==========================================
+// Startup & 22-Hour Automatic Token Rotation
+// ==========================================
 const PORT = process.env.PORT || 4000;
-server.listen(PORT, '0.0.0.0', () => {
+server.listen(PORT, '0.0.0.0', async () => {
   console.log(`🚀 Gateway Server running on port ${PORT}`);
+  await refreshDhanAccessToken(false);
+  connectDhan();
+
+  // Automatically renew token every 22 hours before 24h expiry
+  setInterval(() => {
+    console.log('⏰ [Auth] Running scheduled 22-hour Dhan token renewal...');
+    refreshDhanAccessToken(true);
+  }, 22 * 60 * 60 * 1000);
 });
