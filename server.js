@@ -24,6 +24,30 @@ let dhanConnected = false;
 // Map: securityId -> { count: number, segment: string }
 const activeSubscriptions = new Map();
 
+// ==========================================
+// Helpers: Segment & Instrument Normalization for Dhan v2
+// ==========================================
+function normalizeSegment(seg) {
+  if (!seg) return 'NSE_EQ';
+  const s = String(seg).toUpperCase().trim();
+  if (s === 'INDEX' || s === 'NSE_IDX' || s === 'BSE_IDX' || s === 'IDX_I') return 'IDX_I';
+  if (s === 'NFO' || s === 'FNO' || s === 'NSE_FNO') return 'NSE_FNO';
+  if (s === 'BFO' || s === 'BSE_FNO') return 'BSE_FNO';
+  if (s === 'MCX' || s === 'MCX_COMM') return 'MCX_COMM';
+  if (s === 'BSE' || s === 'BSE_EQ') return 'BSE_EQ';
+  return s;
+}
+
+function resolveInstrument(segment, queryInstrument) {
+  if (queryInstrument && String(queryInstrument).toUpperCase() !== 'EQUITY') {
+    return String(queryInstrument).toUpperCase().trim();
+  }
+  if (segment === 'IDX_I') return 'INDEX';
+  if (segment === 'NSE_FNO' || segment === 'BSE_FNO') return 'OPTIDX';
+  if (segment === 'MCX_COMM') return 'FUTCOM';
+  return 'EQUITY';
+}
+
 // Railway / Uptime Health Check endpoint
 app.get('/', (req, res) => {
   res.json({
@@ -36,14 +60,14 @@ app.get('/', (req, res) => {
 });
 
 // ==========================================
-// REST Route: Historical & Intraday Data Proxy with Infinite Scroll Support
+// REST Route: Historical & Intraday Data Proxy (Equities, Indices & F&O)
 // ==========================================
 app.get('/api/charts/historical', async (req, res) => {
   try {
     const {
       securityId,
       exchangeSegment = 'NSE_EQ',
-      instrument = 'EQUITY',
+      instrument,
       interval = '1D', // '1D', '1', '5', '15', '25', '60'
       fromDate,
       toDate,
@@ -56,6 +80,11 @@ app.get('/api/charts/historical', async (req, res) => {
     if (!ACCESS_TOKEN) {
       return res.status(500).json({ error: 'Dhan ACCESS_TOKEN is not configured on server' });
     }
+
+    const cleanSegment = normalizeSegment(exchangeSegment);
+    const cleanInstrument = resolveInstrument(cleanSegment, instrument);
+    const includeOI =
+      cleanSegment === 'NSE_FNO' || cleanSegment === 'BSE_FNO' || cleanSegment === 'MCX_COMM';
 
     // Helper: Format date to YYYY-MM-DD in IST
     const formatISTDate = (dateObj) => {
@@ -104,10 +133,10 @@ app.get('/api/charts/historical', async (req, res) => {
 
       payload = {
         securityId: String(securityId),
-        exchangeSegment: exchangeSegment,
-        instrument: instrument,
+        exchangeSegment: cleanSegment,
+        instrument: cleanInstrument,
         expiryCode: 0,
-        oi: false,
+        oi: includeOI,
         fromDate: fromDate || formatISTDate(past2Years),
         toDate: toDate || formatISTDate(tomorrow),
       };
@@ -121,10 +150,10 @@ app.get('/api/charts/historical', async (req, res) => {
 
       payload = {
         securityId: String(securityId),
-        exchangeSegment: exchangeSegment,
-        instrument: instrument,
+        exchangeSegment: cleanSegment,
+        instrument: cleanInstrument,
         interval: String(interval),
-        oi: false,
+        oi: includeOI,
         fromDate: fromDate || `${formatISTDate(pastDays)} 09:15:00`,
         toDate: toDate || formatISTDateTime(now),
       };
@@ -160,15 +189,24 @@ app.get('/api/charts/historical', async (req, res) => {
           low: Number(data.low[idx]),
           close: Number(data.close[idx]),
           volume: Number(data.volume ? data.volume[idx] : 0),
+          ...(includeOI && data.open_interest ? { oi: Number(data.open_interest[idx]) } : {}),
         };
       });
 
       bars.sort((a, b) => a.time - b.time);
-      return res.json({ success: true, count: bars.length, interval, bars });
+      return res.json({
+        success: true,
+        count: bars.length,
+        interval,
+        segment: cleanSegment,
+        instrument: cleanInstrument,
+        bars,
+      });
     }
 
     return res.status(404).json({
       error: 'No candle data returned from Dhan',
+      sentPayload: payload,
       details: data,
     });
   } catch (error) {
@@ -297,23 +335,25 @@ io.on('connection', (socket) => {
   socket.on('subscribe', ({ securityId, segment = 'NSE_EQ' }) => {
     if (!securityId) return;
     const idStr = String(securityId);
+    const cleanSegment = normalizeSegment(segment);
     const room = `stock:${idStr}`;
     socket.join(room);
 
     const existing = activeSubscriptions.get(idStr);
     if (!existing) {
-      activeSubscriptions.set(idStr, { count: 1, segment });
-      sendSubscription(15, [{ ExchangeSegment: segment, SecurityId: idStr }]);
-      console.log(`[Subscribed Dhan] SecurityId: ${idStr} (${segment})`);
+      activeSubscriptions.set(idStr, { count: 1, segment: cleanSegment });
+      sendSubscription(15, [{ ExchangeSegment: cleanSegment, SecurityId: idStr }]);
+      console.log(`[Subscribed Dhan] SecurityId: ${idStr} (${cleanSegment})`);
     } else {
       existing.count += 1;
-      existing.segment = segment;
+      existing.segment = cleanSegment;
     }
   });
 
   socket.on('unsubscribe', ({ securityId, segment = 'NSE_EQ' }) => {
     if (!securityId) return;
     const idStr = String(securityId);
+    const cleanSegment = normalizeSegment(segment);
     const room = `stock:${idStr}`;
     socket.leave(room);
 
@@ -321,7 +361,7 @@ io.on('connection', (socket) => {
     if (existing) {
       if (existing.count <= 1) {
         activeSubscriptions.delete(idStr);
-        sendSubscription(16, [{ ExchangeSegment: existing.segment || segment, SecurityId: idStr }]);
+        sendSubscription(16, [{ ExchangeSegment: existing.segment || cleanSegment, SecurityId: idStr }]);
         console.log(`[Unsubscribed Dhan] SecurityId: ${idStr}`);
       } else {
         existing.count -= 1;
